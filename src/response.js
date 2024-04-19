@@ -1,53 +1,48 @@
+
 /**
- * Response.js
+ * response.js
  *
  * Response class provides content decoding
  */
 
+import http from 'http';
+
 import Headers from './headers.js';
-import Body, {clone, extractContentType} from './body.js';
-import {isRedirect} from './utils/is-redirect.js';
+import Body, { clone, extractContentType } from './body';
 
 const INTERNALS = Symbol('Response internals');
 
+// fix an issue where "STATUS_CODES" aren't a named export for node <10
+const STATUS_CODES = http.STATUS_CODES;
+
 /**
  * Response class
- *
- * Ref: https://fetch.spec.whatwg.org/#response-class
  *
  * @param   Stream  body  Readable stream
  * @param   Object  opts  Response options
  * @return  Void
  */
-export default class Response extends Body {
-	constructor(body = null, options = {}) {
-		super(body, options);
+export default class Response {
+	constructor(body = null, opts = {}) {
+		Body.call(this, body, opts);
 
-		// eslint-disable-next-line no-eq-null, eqeqeq, no-negated-condition
-		const status = options.status != null ? options.status : 200;
+		const status = opts.status || 200;
+		const headers = new Headers(opts.headers)
 
-		const headers = new Headers(options.headers);
-
-		if (body !== null && !headers.has('Content-Type')) {
-			const contentType = extractContentType(body, this);
+		if (body != null && !headers.has('Content-Type')) {
+			const contentType = extractContentType(body);
 			if (contentType) {
 				headers.append('Content-Type', contentType);
 			}
 		}
 
 		this[INTERNALS] = {
-			type: 'default',
-			url: options.url,
+			url: opts.url,
 			status,
-			statusText: options.statusText || '',
+			statusText: opts.statusText || STATUS_CODES[status],
 			headers,
-			counter: options.counter,
-			highWaterMark: options.highWaterMark
+			counter: opts.counter
 		};
-	}
-
-	get type() {
-		return this[INTERNALS].type;
 	}
 
 	get url() {
@@ -77,84 +72,38 @@ export default class Response extends Body {
 		return this[INTERNALS].headers;
 	}
 
-	get highWaterMark() {
-		return this[INTERNALS].highWaterMark;
-	}
-
 	/**
 	 * Clone this response
 	 *
 	 * @return  Response
 	 */
 	clone() {
-		return new Response(clone(this, this.highWaterMark), {
-			type: this.type,
+		return new Response(clone(this), {
 			url: this.url,
 			status: this.status,
 			statusText: this.statusText,
 			headers: this.headers,
 			ok: this.ok,
-			redirected: this.redirected,
-			size: this.size,
-			highWaterMark: this.highWaterMark
+			redirected: this.redirected
 		});
-	}
-
-	/**
-	 * @param {string} url    The URL that the new response is to originate from.
-	 * @param {number} status An optional status code for the response (e.g., 302.)
-	 * @returns {Response}    A Response object.
-	 */
-	static redirect(url, status = 302) {
-		if (!isRedirect(status)) {
-			throw new RangeError('Failed to execute "redirect" on "response": Invalid status code');
-		}
-
-		return new Response(null, {
-			headers: {
-				location: new URL(url).toString()
-			},
-			status
-		});
-	}
-
-	static error() {
-		const response = new Response(null, {status: 0, statusText: ''});
-		response[INTERNALS].type = 'error';
-		return response;
-	}
-
-	static json(data = undefined, init = {}) {
-		const body = JSON.stringify(data);
-
-		if (body === undefined) {
-			throw new TypeError('data is not JSON serializable');
-		}
-
-		const headers = new Headers(init && init.headers);
-
-		if (!headers.has('content-type')) {
-			headers.set('content-type', 'application/json');
-		}
-
-		return new Response(body, {
-			...init,
-			headers
-		});
-	}
-
-	get [Symbol.toStringTag]() {
-		return 'Response';
 	}
 }
 
+Body.mixIn(Response.prototype);
+
 Object.defineProperties(Response.prototype, {
-	type: {enumerable: true},
-	url: {enumerable: true},
-	status: {enumerable: true},
-	ok: {enumerable: true},
-	redirected: {enumerable: true},
-	statusText: {enumerable: true},
-	headers: {enumerable: true},
-	clone: {enumerable: true}
+	url: { enumerable: true },
+	status: { enumerable: true },
+	ok: { enumerable: true },
+	redirected: { enumerable: true },
+	statusText: { enumerable: true },
+	headers: { enumerable: true },
+	clone: { enumerable: true }
+});
+
+Object.defineProperty(Response.prototype, Symbol.toStringTag, {
+	value: 'Response',
+	writable: false,
+	enumerable: false,
+	configurable: true
 });

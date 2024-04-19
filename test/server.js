@@ -1,60 +1,37 @@
-import http from 'node:http';
-import zlib from 'node:zlib';
-import {once} from 'node:events';
-import busboy from 'busboy';
+import * as http from 'http';
+import { parse } from 'url';
+import * as zlib from 'zlib';
+import { multipart as Multipart } from 'parted';
+
+let convert;
+try { convert = require('encoding').convert; } catch(e) {}
 
 export default class TestServer {
-	constructor(hostname) {
+	constructor() {
 		this.server = http.createServer(this.router);
-		// Node 8 default keepalive timeout is 5000ms
+		this.port = 30001;
+		this.hostname = 'localhost';
+		// node 8 default keepalive timeout is 5000ms
 		// make it shorter here as we want to close server quickly at the end of tests
 		this.server.keepAliveTimeout = 1000;
-		this.server.on('error', err => {
+		this.server.on('error', function(err) {
 			console.log(err.stack);
 		});
-		this.server.on('connection', socket => {
+		this.server.on('connection', function(socket) {
 			socket.setTimeout(1500);
 		});
-		this.hostname = hostname || 'localhost';
 	}
 
-	async start() {
-		let host = this.hostname;
-		if (host.startsWith('[')) {
-			// If we're trying to listen on an IPv6 literal hostname, strip the
-			// square brackets before binding to the IPv6 address
-			host = host.slice(1, -1);
-		}
-
-		this.server.listen(0, host);
-		return once(this.server, 'listening');
+	start(cb) {
+		this.server.listen(this.port, this.hostname, cb);
 	}
 
-	async stop() {
-		this.server.close();
-		return once(this.server, 'close');
+	stop(cb) {
+		this.server.close(cb);
 	}
 
-	get port() {
-		return this.server.address().port;
-	}
-
-	mockResponse(responseHandler) {
-		this.server.nextResponseHandler = responseHandler;
-		return `http://${this.hostname}:${this.port}/mocked`;
-	}
-
-	router(request, res) {
-		const p = request.url;
-
-		if (p === '/mocked') {
-			if (this.nextResponseHandler) {
-				this.nextResponseHandler(res);
-				this.nextResponseHandler = undefined;
-			} else {
-				throw new Error('No mocked response. Use ’TestServer.mockResponse()’.');
-			}
-		}
+	router(req, res) {
+		let p = decodeURIComponent(parse(req.url).pathname);
 
 		if (p === '/hello') {
 			res.statusCode = 200;
@@ -62,20 +39,10 @@ export default class TestServer {
 			res.end('world');
 		}
 
-		if (p.includes('question')) {
-			res.statusCode = 200;
-			res.setHeader('Content-Type', 'text/plain');
-			res.end('ok');
-		}
-
 		if (p === '/plain') {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'text/plain');
 			res.end('text');
-		}
-
-		if (p === '/no-status-text') {
-			res.writeHead(200, '', {}).end();
 		}
 
 		if (p === '/options') {
@@ -98,15 +65,17 @@ export default class TestServer {
 			}));
 		}
 
+		if (p.startsWith('/redirect-to/3')) {
+			res.statusCode = p.slice(13, 16);
+			res.setHeader('Location', p.slice(17));
+			res.end();
+		}
+
 		if (p === '/gzip') {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'text/plain');
 			res.setHeader('Content-Encoding', 'gzip');
-			zlib.gzip('hello world', (err, buffer) => {
-				if (err) {
-					throw err;
-				}
-
+			zlib.gzip('hello world', function(err, buffer) {
 				res.end(buffer);
 			});
 		}
@@ -115,26 +84,9 @@ export default class TestServer {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'text/plain');
 			res.setHeader('Content-Encoding', 'gzip');
-			zlib.gzip('hello world', (err, buffer) => {
-				if (err) {
-					throw err;
-				}
-
-				// Truncate the CRC checksum and size check at the end of the stream
-				res.end(buffer.slice(0, -8));
-			});
-		}
-
-		if (p === '/gzip-capital') {
-			res.statusCode = 200;
-			res.setHeader('Content-Type', 'text/plain');
-			res.setHeader('Content-Encoding', 'GZip');
-			zlib.gzip('hello world', (err, buffer) => {
-				if (err) {
-					throw err;
-				}
-
-				res.end(buffer);
+			zlib.gzip('hello world', function(err, buffer) {
+				// truncate the CRC checksum and size check at the end of the stream
+				res.end(buffer.slice(0, buffer.length - 8));
 			});
 		}
 
@@ -142,11 +94,7 @@ export default class TestServer {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'text/plain');
 			res.setHeader('Content-Encoding', 'deflate');
-			zlib.deflate('hello world', (err, buffer) => {
-				if (err) {
-					throw err;
-				}
-
+			zlib.deflate('hello world', function(err, buffer) {
 				res.end(buffer);
 			});
 		}
@@ -156,25 +104,18 @@ export default class TestServer {
 			res.setHeader('Content-Type', 'text/plain');
 			if (typeof zlib.createBrotliDecompress === 'function') {
 				res.setHeader('Content-Encoding', 'br');
-				zlib.brotliCompress('hello world', (err, buffer) => {
-					if (err) {
-						throw err;
-					}
-
+				zlib.brotliCompress('hello world', function (err, buffer) {
 					res.end(buffer);
 				});
 			}
 		}
 
+
 		if (p === '/deflate-raw') {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'text/plain');
 			res.setHeader('Content-Encoding', 'deflate');
-			zlib.deflateRaw('hello world', (err, buffer) => {
-				if (err) {
-					throw err;
-				}
-
+			zlib.deflateRaw('hello world', function(err, buffer) {
 				res.end(buffer);
 			});
 		}
@@ -201,7 +142,7 @@ export default class TestServer {
 		}
 
 		if (p === '/timeout') {
-			setTimeout(() => {
+			setTimeout(function() {
 				res.statusCode = 200;
 				res.setHeader('Content-Type', 'text/plain');
 				res.end('text');
@@ -212,7 +153,7 @@ export default class TestServer {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'text/plain');
 			res.write('test');
-			setTimeout(() => {
+			setTimeout(function() {
 				res.end('test');
 			}, 1000);
 		}
@@ -226,10 +167,10 @@ export default class TestServer {
 		if (p === '/size/chunk') {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'text/plain');
-			setTimeout(() => {
+			setTimeout(function() {
 				res.write('test');
 			}, 10);
-			setTimeout(() => {
+			setTimeout(function() {
 				res.end('test');
 			}, 20);
 		}
@@ -240,27 +181,72 @@ export default class TestServer {
 			res.end('testtest');
 		}
 
+		if (p === '/encoding/gbk') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/html');
+			res.end(convert('<meta charset="gbk"><div>中文</div>', 'gbk'));
+		}
+
+		if (p === '/encoding/gb2312') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/html');
+			res.end(convert('<meta http-equiv="Content-Type" content="text/html; charset=gb2312"><div>中文</div>', 'gb2312'));
+		}
+
+		if (p === '/encoding/gb2312-reverse') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/html');
+			res.end(convert('<meta content="text/html; charset=gb2312" http-equiv="Content-Type"><div>中文</div>', 'gb2312'));
+		}
+
+		if (p === '/encoding/shift-jis') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/html; charset=Shift-JIS');
+			res.end(convert('<div>日本語</div>', 'Shift_JIS'));
+		}
+
+		if (p === '/encoding/euc-jp') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/xml');
+			res.end(convert('<?xml version="1.0" encoding="EUC-JP"?><title>日本語</title>', 'EUC-JP'));
+		}
+
+		if (p === '/encoding/utf8') {
+			res.statusCode = 200;
+			res.end('中文');
+		}
+
+		if (p === '/encoding/order1') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'charset=gbk; text/plain');
+			res.end(convert('中文', 'gbk'));
+		}
+
+		if (p === '/encoding/order2') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/plain; charset=gbk; qs=1');
+			res.end(convert('中文', 'gbk'));
+		}
+
+		if (p === '/encoding/chunked') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/html');
+			res.setHeader('Transfer-Encoding', 'chunked');
+			res.write('a'.repeat(10));
+			res.end(convert('<meta http-equiv="Content-Type" content="text/html; charset=Shift_JIS" /><div>日本語</div>', 'Shift_JIS'));
+		}
+
+		if (p === '/encoding/invalid') {
+			res.statusCode = 200;
+			res.setHeader('Content-Type', 'text/html');
+			res.setHeader('Transfer-Encoding', 'chunked');
+			res.write('a'.repeat(1200));
+			res.end(convert('中文', 'gbk'));
+		}
+
 		if (p === '/redirect/301') {
 			res.statusCode = 301;
 			res.setHeader('Location', '/inspect');
-			res.end();
-		}
-
-		if (p === '/redirect/301/invalid') {
-			res.statusCode = 301;
-			res.setHeader('Location', '//super:invalid:url%/');
-			res.end();
-		}
-
-		if (p.startsWith('/redirect-to/3')) {
-			res.statusCode = p.slice(13, 16);
-			res.setHeader('Location', p.slice(17));
-			res.end();
-		}
-
-		if (p === '/redirect/301/otherhost') {
-			res.statusCode = 301;
-			res.setHeader('Location', 'https://github.com/node-fetch');
 			res.end();
 		}
 
@@ -302,7 +288,7 @@ export default class TestServer {
 		if (p === '/redirect/slow') {
 			res.statusCode = 301;
 			res.setHeader('Location', '/redirect/301');
-			setTimeout(() => {
+			setTimeout(function() {
 				res.end();
 			}, 1000);
 		}
@@ -310,7 +296,7 @@ export default class TestServer {
 		if (p === '/redirect/slow-chain') {
 			res.statusCode = 301;
 			res.setHeader('Location', '/redirect/slow');
-			setTimeout(() => {
+			setTimeout(function() {
 				res.end();
 			}, 10);
 		}
@@ -319,33 +305,6 @@ export default class TestServer {
 			res.statusCode = 301;
 			res.setHeader('Location', '/slow');
 			res.end();
-		}
-
-		if (p === '/redirect/bad-location') {
-			res.socket.write('HTTP/1.1 301\r\nLocation: <>\r\nContent-Length: 0\r\n');
-			res.socket.end('\r\n');
-		}
-
-		if (p === '/redirect/referrer-policy') {
-			res.statusCode = 301;
-			res.setHeader('Location', '/inspect');
-			res.setHeader('Referrer-Policy', 'foo unsafe-url bar');
-			res.end();
-		}
-
-		if (p === '/redirect/referrer-policy/same-origin') {
-			res.statusCode = 301;
-			res.setHeader('Location', '/inspect');
-			res.setHeader('Referrer-Policy', 'foo unsafe-url same-origin bar');
-			res.end();
-		}
-
-		if (p === '/redirect/chunked') {
-			res.writeHead(301, {
-				Location: '/inspect',
-				'Transfer-Encoding': 'chunked'
-			});
-			setTimeout(() => res.end(), 10);
 		}
 
 		if (p === '/error/400') {
@@ -370,47 +329,32 @@ export default class TestServer {
 			res.destroy();
 		}
 
-		if (p === '/error/premature') {
-			res.writeHead(200, {'content-length': 50});
-			res.write('foo');
-			setTimeout(() => {
-				res.destroy();
-			}, 100);
-		}
-
 		if (p === '/error/premature/chunked') {
 			res.writeHead(200, {
 				'Content-Type': 'application/json',
 				'Transfer-Encoding': 'chunked'
 			});
 
-			res.write(`${JSON.stringify({data: 'hi'})}\n`);
+			// Transfer-Encoding: 'chunked' sends chunk sizes followed by the
+			// chunks - https://en.wikipedia.org/wiki/Chunked_transfer_encoding
+			const sendChunk = (obj) => {
+				const data = JSON.stringify(obj)
+
+				res.write(`${data.length}\r\n`)
+				res.write(`${data}\r\n`)
+			}
+
+			sendChunk({data: 'hi'})
 
 			setTimeout(() => {
-				res.write(`${JSON.stringify({data: 'bye'})}\n`);
+				sendChunk({data: 'bye'})
 			}, 200);
 
 			setTimeout(() => {
+				// should send '0\r\n\r\n' to end the response properly but instead
+				// just close the connection
 				res.destroy();
 			}, 400);
-		}
-
-		if (p === '/chunked/split-ending') {
-			res.socket.write('HTTP/1.1 200\r\nTransfer-Encoding: chunked\r\n\r\n');
-			res.socket.write('3\r\nfoo\r\n3\r\nbar\r\n');
-
-			setTimeout(() => {
-				res.socket.write('0\r\n');
-			}, 10);
-
-			setTimeout(() => {
-				res.socket.end('\r\n');
-			}, 20);
-		}
-
-		if (p === '/chunked/multiple-ending') {
-			res.socket.write('HTTP/1.1 200\r\nTransfer-Encoding: chunked\r\n\r\n');
-			res.socket.write('3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n');
 		}
 
 		if (p === '/error/json') {
@@ -451,48 +395,47 @@ export default class TestServer {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'application/json');
 			let body = '';
-			request.on('data', c => {
-				body += c;
-			});
-			request.on('end', () => {
+			req.on('data', function(c) { body += c });
+			req.on('end', function() {
 				res.end(JSON.stringify({
-					method: request.method,
-					url: request.url,
-					headers: request.headers,
+					method: req.method,
+					url: req.url,
+					headers: req.headers,
 					body
 				}));
 			});
 		}
 
 		if (p === '/multipart') {
-			let body = '';
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'application/json');
-			const bb = busboy({headers: request.headers});
-			bb.on('file', async (fieldName, file, info) => {
-				body += `${fieldName}=${info.filename}`;
-				// consume file data
-				// eslint-disable-next-line no-empty, no-unused-vars
-				for await (const c of file) {}
+			const parser = new Multipart(req.headers['content-type']);
+			let body = '';
+			parser.on('part', function(field, part) {
+				body += field + '=' + part;
 			});
-			bb.on('field', (fieldName, value) => {
-				body += `${fieldName}=${value}`;
-			});
-			bb.on('close', () => {
+			parser.on('end', function() {
 				res.end(JSON.stringify({
-					method: request.method,
-					url: request.url,
-					headers: request.headers,
-					body
+					method: req.method,
+					url: req.url,
+					headers: req.headers,
+					body: body
 				}));
 			});
-			request.pipe(bb);
+			req.pipe(parser);
 		}
 
-		if (p === '/m%C3%B6bius') {
+		if (p === '/issues/1290/ひらがな') {
 			res.statusCode = 200;
 			res.setHeader('Content-Type', 'text/plain');
-			res.end('ok');
+			res.end('Success');
 		}
 	}
+}
+
+if (require.main === module) {
+	const server = new TestServer;
+	server.start(() => {
+		console.log(`Server started listening at port ${server.port}`);
+	});
 }
