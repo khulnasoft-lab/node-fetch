@@ -1,84 +1,91 @@
+
 /**
- * Index.js
+ * index.js
  *
  * a request API compatible with window.fetch
  *
  * All spec algorithm step numbers are based on https://fetch.spec.whatwg.org/commit-snapshots/ae716822cb3a61843226cd090eefc6589446c1d2/.
  */
 
-import http from 'node:http';
-import https from 'node:https';
-import zlib from 'node:zlib';
-import Stream, {PassThrough, pipeline as pump} from 'node:stream';
-import {Buffer} from 'node:buffer';
+import Url from 'url';
+import http from 'http';
+import https from 'https';
+import zlib from 'zlib';
+import Stream from 'stream';
 
-import dataUriToBuffer from 'data-uri-to-buffer';
-
-import {writeToStream, clone} from './body.js';
+import Body, { writeToStream, getTotalBytes } from './body.js';
 import Response from './response.js';
-import Headers, {fromRawHeaders} from './headers.js';
-import Request, {getNodeRequestOptions} from './request.js';
-import {FetchError} from './errors/fetch-error.js';
-import {AbortError} from './errors/abort-error.js';
-import {isRedirect} from './utils/is-redirect.js';
-import {FormData} from 'formdata-polyfill/esm.min.js';
-import {isDomainOrSubdomain, isSameProtocol} from './utils/is.js';
-import {parseReferrerPolicyFromHeader} from './utils/referrer.js';
-import {
-	Blob,
-	File,
-	fileFromSync,
-	fileFrom,
-	blobFromSync,
-	blobFrom
-} from 'fetch-blob/from.js';
+import Headers, { createHeadersLenient } from './headers.js';
+import Request, { getNodeRequestOptions } from './request.js';
+import FetchError from './fetch-error.js';
+import AbortError from './abort-error.js';
 
-export {FormData, Headers, Request, Response, FetchError, AbortError, isRedirect};
-export {Blob, File, fileFromSync, fileFrom, blobFromSync, blobFrom};
+import whatwgUrl from 'whatwg-url';
 
-const supportedSchemas = new Set(['data:', 'http:', 'https:']);
+const URL = Url.URL || whatwgUrl.URL;
+
+// fix an issue where "PassThrough", "resolve" aren't a named export for node <10
+const PassThrough = Stream.PassThrough;
+
+const isDomainOrSubdomain = (destination, original) => {
+	const orig = new URL(original).hostname;
+	const dest = new URL(destination).hostname;
+
+	return orig === dest || (
+		orig[orig.length - dest.length - 1] === '.' && orig.endsWith(dest)
+	);
+};
+
+/**
+ * isSameProtocol reports whether the two provided URLs use the same protocol.
+ *
+ * Both domains must already be in canonical form.
+ * @param {string|URL} original
+ * @param {string|URL} destination
+ */
+const isSameProtocol = (destination, original) => {
+       const orig = new URL(original).protocol;
+       const dest = new URL(destination).protocol;
+
+       return orig === dest;
+};
+
 
 /**
  * Fetch function
  *
- * @param   {string | URL | import('./request').default} url - Absolute url or Request instance
- * @param   {*} [options_] - Fetch options
- * @return  {Promise<import('./response').default>}
+ * @param   Mixed    url   Absolute url or Request instance
+ * @param   Object   opts  Fetch options
+ * @return  Promise
  */
-export default async function fetch(url, options_) {
-	return new Promise((resolve, reject) => {
-		// Build request object
-		const request = new Request(url, options_);
-		const {parsedURL, options} = getNodeRequestOptions(request);
-		if (!supportedSchemas.has(parsedURL.protocol)) {
-			throw new TypeError(`node-fetch cannot load ${url}. URL scheme "${parsedURL.protocol.replace(/:$/, '')}" is not supported.`);
-		}
+export default function fetch(url, opts) {
 
-		if (parsedURL.protocol === 'data:') {
-			const data = dataUriToBuffer(request.url);
-			const response = new Response(data, {headers: {'Content-Type': data.typeFull}});
-			resolve(response);
-			return;
-		}
+	// allow custom promise
+	if (!fetch.Promise) {
+		throw new Error('native promise missing, set fetch.Promise to your favorite alternative');
+	}
 
-		// Wrap http.request into fetch
-		const send = (parsedURL.protocol === 'https:' ? https : http).request;
-		const {signal} = request;
+	Body.Promise = fetch.Promise;
+
+	// wrap http.request into fetch
+	return new fetch.Promise((resolve, reject) => {
+		// build request object
+		const request = new Request(url, opts);
+		const options = getNodeRequestOptions(request);
+
+		const send = (options.protocol === 'https:' ? https : http).request;
+		const { signal } = request;
 		let response = null;
 
-		const abort = () => {
-			const error = new AbortError('The operation was aborted.');
+		const abort = ()  => {
+			let error = new AbortError('The user aborted a request.');
 			reject(error);
 			if (request.body && request.body instanceof Stream.Readable) {
-				request.body.destroy(error);
+				destroyStream(request.body, error);
 			}
-
-			if (!response || !response.body) {
-				return;
-			}
-
+			if (!response || !response.body) return;
 			response.body.emit('error', error);
-		};
+		}
 
 		if (signal && signal.aborted) {
 			abort();
@@ -88,67 +95,85 @@ export default async function fetch(url, options_) {
 		const abortAndFinalize = () => {
 			abort();
 			finalize();
-		};
+		}
 
-		// Send request
-		const request_ = send(parsedURL.toString(), options);
+		// send request
+		const req = send(options);
+		let reqTimeout;
 
 		if (signal) {
 			signal.addEventListener('abort', abortAndFinalize);
 		}
 
-		const finalize = () => {
-			request_.abort();
-			if (signal) {
-				signal.removeEventListener('abort', abortAndFinalize);
-			}
-		};
+		function finalize() {
+			req.abort();
+			if (signal) signal.removeEventListener('abort', abortAndFinalize);
+			clearTimeout(reqTimeout);
+		}
 
-		request_.on('error', error => {
-			reject(new FetchError(`request to ${request.url} failed, reason: ${error.message}`, 'system', error));
+		if (request.timeout) {
+			req.once('socket', socket => {
+				reqTimeout = setTimeout(() => {
+					reject(new FetchError(`network timeout at: ${request.url}`, 'request-timeout'));
+					finalize();
+				}, request.timeout);
+			});
+		}
+
+		req.on('error', err => {
+			reject(new FetchError(`request to ${request.url} failed, reason: ${err.message}`, 'system', err));
+
+			if (response && response.body) {
+				destroyStream(response.body, err);
+			}
+
 			finalize();
 		});
 
-		fixResponseChunkedTransferBadEnding(request_, error => {
+		fixResponseChunkedTransferBadEnding(req, err => {
+			if (signal && signal.aborted) {
+				return
+			}
+
 			if (response && response.body) {
-				response.body.destroy(error);
+				destroyStream(response.body, err);
 			}
 		});
 
 		/* c8 ignore next 18 */
-		if (process.version < 'v14') {
+		if (parseInt(process.version.substring(1)) < 14) {
 			// Before Node.js 14, pipeline() does not fully support async iterators and does not always
 			// properly handle when the socket close/end events are out of order.
-			request_.on('socket', s => {
-				let endedWithEventsCount;
-				s.prependListener('end', () => {
-					endedWithEventsCount = s._eventsCount;
-				});
-				s.prependListener('close', hadError => {
+			req.on('socket', s => {
+				s.addListener('close', hadError => {
+					// if a data listener is still present we didn't end cleanly
+					const hasDataListener = s.listenerCount('data') > 0
+
 					// if end happened before close but the socket didn't emit an error, do it now
-					if (response && endedWithEventsCount < s._eventsCount && !hadError) {
-						const error = new Error('Premature close');
-						error.code = 'ERR_STREAM_PREMATURE_CLOSE';
-						response.body.emit('error', error);
+					if (response && hasDataListener && !hadError && !(signal && signal.aborted)) {
+						const err = new Error('Premature close');
+						err.code = 'ERR_STREAM_PREMATURE_CLOSE';
+						response.body.emit('error', err);
 					}
 				});
 			});
 		}
 
-		request_.on('response', response_ => {
-			request_.setTimeout(0);
-			const headers = fromRawHeaders(response_.rawHeaders);
+		req.on('response', res => {
+			clearTimeout(reqTimeout);
+
+			const headers = createHeadersLenient(res.headers);
 
 			// HTTP fetch step 5
-			if (isRedirect(response_.statusCode)) {
+			if (fetch.isRedirect(res.statusCode)) {
 				// HTTP fetch step 5.2
 				const location = headers.get('Location');
 
 				// HTTP fetch step 5.3
 				let locationURL = null;
 				try {
-					locationURL = location === null ? null : new URL(location, request.url);
-				} catch {
+					locationURL = location === null ? null : new URL(location, request.url).toString();
+				} catch (err) {
 					// error here can only be invalid URL in Location: header
 					// do not throw when options.redirect == manual
 					// let the user extract the errorneous redirect URL
@@ -166,9 +191,18 @@ export default async function fetch(url, options_) {
 						finalize();
 						return;
 					case 'manual':
-						// Nothing to do
+						// node-fetch-specific step: make manual redirect a bit easier to use by setting the Location header value to the resolved URL.
+						if (locationURL !== null) {
+							// handle corrupted header
+							try {
+								headers.set('Location', locationURL);
+							} catch (err) {
+								// istanbul ignore next: nodejs server prevent invalid response headers, we can't test this through normal request
+								reject(err);
+							}
+						}
 						break;
-					case 'follow': {
+					case 'follow':
 						// HTTP-redirect fetch step 2
 						if (locationURL === null) {
 							break;
@@ -183,92 +217,60 @@ export default async function fetch(url, options_) {
 
 						// HTTP-redirect fetch step 6 (counter increment)
 						// Create a new Request object.
-						const requestOptions = {
+						const requestOpts = {
 							headers: new Headers(request.headers),
 							follow: request.follow,
 							counter: request.counter + 1,
 							agent: request.agent,
 							compress: request.compress,
 							method: request.method,
-							body: clone(request),
+							body: request.body,
 							signal: request.signal,
-							size: request.size,
-							referrer: request.referrer,
-							referrerPolicy: request.referrerPolicy
+							timeout: request.timeout,
+              size: request.size
 						};
 
-						// when forwarding sensitive headers like "Authorization",
-						// "WWW-Authenticate", and "Cookie" to untrusted targets,
-						// headers will be ignored when following a redirect to a domain
-						// that is not a subdomain match or exact match of the initial domain.
-						// For example, a redirect from "foo.com" to either "foo.com" or "sub.foo.com"
-						// will forward the sensitive headers, but a redirect to "bar.com" will not.
-						// headers will also be ignored when following a redirect to a domain using
-						// a different protocol. For example, a redirect from "https://foo.com" to "http://foo.com"
-						// will not forward the sensitive headers
 						if (!isDomainOrSubdomain(request.url, locationURL) || !isSameProtocol(request.url, locationURL)) {
 							for (const name of ['authorization', 'www-authenticate', 'cookie', 'cookie2']) {
-								requestOptions.headers.delete(name);
+								requestOpts.headers.delete(name);
 							}
 						}
 
 						// HTTP-redirect fetch step 9
-						if (response_.statusCode !== 303 && request.body && options_.body instanceof Stream.Readable) {
+						if (res.statusCode !== 303 && request.body && getTotalBytes(request) === null) {
 							reject(new FetchError('Cannot follow redirect with body being a readable stream', 'unsupported-redirect'));
 							finalize();
 							return;
 						}
 
 						// HTTP-redirect fetch step 11
-						if (response_.statusCode === 303 || ((response_.statusCode === 301 || response_.statusCode === 302) && request.method === 'POST')) {
-							requestOptions.method = 'GET';
-							requestOptions.body = undefined;
-							requestOptions.headers.delete('content-length');
-						}
-
-						// HTTP-redirect fetch step 14
-						const responseReferrerPolicy = parseReferrerPolicyFromHeader(headers);
-						if (responseReferrerPolicy) {
-							requestOptions.referrerPolicy = responseReferrerPolicy;
+						if (res.statusCode === 303 || ((res.statusCode === 301 || res.statusCode === 302) && request.method === 'POST')) {
+							requestOpts.method = 'GET';
+							requestOpts.body = undefined;
+							requestOpts.headers.delete('content-length');
 						}
 
 						// HTTP-redirect fetch step 15
-						resolve(fetch(new Request(locationURL, requestOptions)));
+						resolve(fetch(new Request(locationURL, requestOpts)));
 						finalize();
 						return;
-					}
-
-					default:
-						return reject(new TypeError(`Redirect option '${request.redirect}' is not a valid value of RequestRedirect`));
 				}
 			}
 
-			// Prepare response
-			if (signal) {
-				response_.once('end', () => {
-					signal.removeEventListener('abort', abortAndFinalize);
-				});
-			}
-
-			let body = pump(response_, new PassThrough(), error => {
-				if (error) {
-					reject(error);
-				}
+			// prepare response
+			res.once('end', () => {
+				if (signal) signal.removeEventListener('abort', abortAndFinalize);
 			});
-			// see https://github.com/nodejs/node/pull/29376
-			/* c8 ignore next 3 */
-			if (process.version < 'v12.10') {
-				response_.on('aborted', abortAndFinalize);
-			}
+			let body = res.pipe(new PassThrough());
 
-			const responseOptions = {
+			const response_options = {
 				url: request.url,
-				status: response_.statusCode,
-				statusText: response_.statusMessage,
-				headers,
+				status: res.statusCode,
+				statusText: res.statusMessage,
+				headers: headers,
 				size: request.size,
-				counter: request.counter,
-				highWaterMark: request.highWaterMark
+				timeout: request.timeout,
+				counter: request.counter
 			};
 
 			// HTTP-network fetch step 12.1.1.3
@@ -282,8 +284,8 @@ export default async function fetch(url, options_) {
 			// 3. no Content-Encoding header
 			// 4. no content response (204)
 			// 5. content not modified response (304)
-			if (!request.compress || request.method === 'HEAD' || codings === null || response_.statusCode === 204 || response_.statusCode === 304) {
-				response = new Response(body, responseOptions);
+			if (!request.compress || request.method === 'HEAD' || codings === null || res.statusCode === 204 || res.statusCode === 304) {
+				response = new Response(body, response_options);
 				resolve(response);
 				return;
 			}
@@ -298,120 +300,107 @@ export default async function fetch(url, options_) {
 				finishFlush: zlib.Z_SYNC_FLUSH
 			};
 
-			// For gzip
-			if (codings === 'gzip' || codings === 'x-gzip') {
-				body = pump(body, zlib.createGunzip(zlibOptions), error => {
-					if (error) {
-						reject(error);
-					}
-				});
-				response = new Response(body, responseOptions);
+			// for gzip
+			if (codings == 'gzip' || codings == 'x-gzip') {
+				body = body.pipe(zlib.createGunzip(zlibOptions));
+				response = new Response(body, response_options);
 				resolve(response);
 				return;
 			}
 
-			// For deflate
-			if (codings === 'deflate' || codings === 'x-deflate') {
-				// Handle the infamous raw deflate response from old servers
+			// for deflate
+			if (codings == 'deflate' || codings == 'x-deflate') {
+				// handle the infamous raw deflate response from old servers
 				// a hack for old IIS and Apache servers
-				const raw = pump(response_, new PassThrough(), error => {
-					if (error) {
-						reject(error);
-					}
-				});
+				const raw = res.pipe(new PassThrough());
 				raw.once('data', chunk => {
-					// See http://stackoverflow.com/questions/37519828
+					// see http://stackoverflow.com/questions/37519828
 					if ((chunk[0] & 0x0F) === 0x08) {
-						body = pump(body, zlib.createInflate(), error => {
-							if (error) {
-								reject(error);
-							}
-						});
+						body = body.pipe(zlib.createInflate());
 					} else {
-						body = pump(body, zlib.createInflateRaw(), error => {
-							if (error) {
-								reject(error);
-							}
-						});
+						body = body.pipe(zlib.createInflateRaw());
 					}
-
-					response = new Response(body, responseOptions);
+					response = new Response(body, response_options);
 					resolve(response);
 				});
-				raw.once('end', () => {
-					// Some old IIS servers return zero-length OK deflate responses, so
-					// 'data' is never emitted. See https://github.com/node-fetch/node-fetch/pull/903
+				raw.on('end', () => {
+					// some old IIS servers return zero-length OK deflate responses, so 'data' is never emitted.
 					if (!response) {
-						response = new Response(body, responseOptions);
+						response = new Response(body, response_options);
 						resolve(response);
 					}
-				});
+				})
 				return;
 			}
 
-			// For br
-			if (codings === 'br') {
-				body = pump(body, zlib.createBrotliDecompress(), error => {
-					if (error) {
-						reject(error);
-					}
-				});
-				response = new Response(body, responseOptions);
+			// for br
+			if (codings == 'br' && typeof zlib.createBrotliDecompress === 'function') {
+				body = body.pipe(zlib.createBrotliDecompress());
+				response = new Response(body, response_options);
 				resolve(response);
 				return;
 			}
 
-			// Otherwise, use response as-is
-			response = new Response(body, responseOptions);
+			// otherwise, use response as-is
+			response = new Response(body, response_options);
 			resolve(response);
 		});
 
-		// eslint-disable-next-line promise/prefer-await-to-then
-		writeToStream(request_, request).catch(reject);
+		writeToStream(req, request);
 	});
-}
+
+};
 
 function fixResponseChunkedTransferBadEnding(request, errorCallback) {
-	const LAST_CHUNK = Buffer.from('0\r\n\r\n');
+	let socket;
 
-	let isChunkedTransfer = false;
-	let properLastChunkReceived = false;
-	let previousChunk;
+	request.on('socket', s => {
+		socket = s;
+	});
 
 	request.on('response', response => {
 		const {headers} = response;
-		isChunkedTransfer = headers['transfer-encoding'] === 'chunked' && !headers['content-length'];
-	});
+		if (headers['transfer-encoding'] === 'chunked' && !headers['content-length']) {
+			response.once('close', hadError => {
+				// tests for socket presence, as in some situations the
+				// the 'socket' event is not triggered for the request
+				// (happens in deno), avoids `TypeError`
+        // if a data listener is still present we didn't end cleanly
+				const hasDataListener = socket && socket.listenerCount('data') > 0;
 
-	request.on('socket', socket => {
-		const onSocketClose = () => {
-			if (isChunkedTransfer && !properLastChunkReceived) {
-				const error = new Error('Premature close');
-				error.code = 'ERR_STREAM_PREMATURE_CLOSE';
-				errorCallback(error);
-			}
-		};
-
-		const onData = buf => {
-			properLastChunkReceived = Buffer.compare(buf.slice(-5), LAST_CHUNK) === 0;
-
-			// Sometimes final 0-length chunk and end of message code are in separate packets
-			if (!properLastChunkReceived && previousChunk) {
-				properLastChunkReceived = (
-					Buffer.compare(previousChunk.slice(-3), LAST_CHUNK.slice(0, 3)) === 0 &&
-					Buffer.compare(buf.slice(-2), LAST_CHUNK.slice(3)) === 0
-				);
-			}
-
-			previousChunk = buf;
-		};
-
-		socket.prependListener('close', onSocketClose);
-		socket.on('data', onData);
-
-		request.on('close', () => {
-			socket.removeListener('close', onSocketClose);
-			socket.removeListener('data', onData);
-		});
+				if (hasDataListener && !hadError) {
+					const err = new Error('Premature close');
+					err.code = 'ERR_STREAM_PREMATURE_CLOSE';
+					errorCallback(err);
+				}
+			});
+		}
 	});
 }
+
+function destroyStream (stream, err) {
+	if (stream.destroy) {
+		stream.destroy(err);
+	} else {
+		// node < 8
+		stream.emit('error', err);
+		stream.end();
+	}
+}
+
+/**
+ * Redirect code matching
+ *
+ * @param   Number   code  Status code
+ * @return  Boolean
+ */
+fetch.isRedirect = code => code === 301 || code === 302 || code === 303 || code === 307 || code === 308;
+
+// expose Promise
+fetch.Promise = global.Promise;
+export {
+	Headers,
+	Request,
+	Response,
+	FetchError
+};
